@@ -5,13 +5,29 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "podscript"
 version = "0.1.0"
-description = "CLI tool to transcribe podcasts and YouTube videos using ElevenLabs Scribe API"
+description = "CLI tool to transcribe podcasts and YouTube videos into clean markdown with speaker diarization and timestamps"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
+authors = [
+    { name = "Tim Farrelly", email = "timf34@github.com" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
 dependencies = [
     "requests>=2.31",
     "feedparser>=6.0",
     "python-dotenv>=1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/timf34/podscript"
+Repository = "https://github.com/timf34/podscript"
+Issues = "https://github.com/timf34/podscript/issues"
 
 [project.scripts]
 podscript = "podscript:main"
