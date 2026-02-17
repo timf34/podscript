@@ -578,7 +578,7 @@ def _diarize_local(audio_path: str, words: list[dict], hf_token: str) -> list[di
     try:
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token,
+            token=hf_token,
         )
 
         import torch
