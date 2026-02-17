@@ -498,6 +498,11 @@ def transcribe_local(
         print(f"Downloaded: {size_mb:.1f} MB\n")
         audio_path = temp_path
 
+    # Validate HF token access upfront before spending time on transcription
+    diarize_pipeline = None
+    if hf_token:
+        diarize_pipeline = _load_diarization_pipeline(hf_token)
+
     try:
         # Auto-detect device and compute type
         import torch
@@ -529,9 +534,9 @@ def transcribe_local(
 
         duration = info.duration
 
-        # Run diarization if HF token is provided
-        if hf_token and words:
-            words = _diarize_local(audio_path, words, hf_token)
+        # Run diarization if pipeline was loaded successfully
+        if diarize_pipeline and words:
+            words = _diarize_local(audio_path, words, diarize_pipeline)
 
         segments = group_into_segments(words)
         return segments, duration
@@ -544,48 +549,91 @@ def transcribe_local(
                 pass
 
 
-def _diarize_local(audio_path: str, words: list[dict], hf_token: str) -> list[dict]:
+def _load_diarization_pipeline(hf_token: str):
     """
-    Run pyannote speaker diarization and assign speaker labels to words.
+    Load the pyannote diarization pipeline upfront, validating access before transcription.
 
-    Args:
-        audio_path: Path to the audio file.
-        words: List of word dicts with text/start/end/speaker_id keys.
-        hf_token: HuggingFace token for pyannote models.
-
-    Returns:
-        Updated word list with speaker_id set from diarization.
+    Returns the pipeline if successful, or None if loading fails.
     """
-    try:
-        from pyannote.audio import Pipeline
-    except (ImportError, Exception) as e:
-        if isinstance(e, ImportError):
-            print(
-                "Warning: pyannote.audio is not installed. Skipping speaker diarization.\n"
-                "All speech will be attributed to Speaker 1.\n"
-                "Install with: pip install podscript[local]",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"Warning: Failed to load pyannote.audio: {e}\n"
-                "Skipping speaker diarization. All speech will be attributed to Speaker 1.",
-                file=sys.stderr,
-            )
-        return words
+    import warnings
 
-    print("Running speaker diarization...")
     try:
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            token=hf_token,
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            from pyannote.audio import Pipeline
+    except ImportError:
+        print(
+            "Warning: pyannote.audio is not installed. Skipping speaker diarization.\n"
+            "All speech will be attributed to Speaker 1.\n"
+            "Install with: pip install podscript[local]",
+            file=sys.stderr,
         )
+        return None
+    except Exception as e:
+        print(
+            f"Warning: Failed to load pyannote.audio: {e}\n"
+            "Skipping speaker diarization. All speech will be attributed to Speaker 1.",
+            file=sys.stderr,
+        )
+        return None
+
+    print("Loading speaker diarization model...")
+    try:
+        with warnings.catch_warnings(), open(os.devnull, "w") as devnull:
+            warnings.simplefilter("ignore")
+            # Redirect stderr to suppress noisy onnxruntime/numpy compatibility messages
+            old_stderr = sys.stderr
+            sys.stderr = devnull
+            try:
+                pipeline = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1",
+                    token=hf_token,
+                )
+            finally:
+                sys.stderr = old_stderr
 
         import torch
 
         if torch.cuda.is_available():
             pipeline.to(torch.device("cuda"))
 
+        print("Diarization model loaded.\n")
+        return pipeline
+    except Exception as e:
+        err = str(e)
+        if "403" in err or "restricted" in err or "gated" in err:
+            print(
+                "Warning: Cannot access pyannote diarization models. "
+                "You need to accept the terms for all of these:\n"
+                "  1. https://huggingface.co/pyannote/speaker-diarization-3.1\n"
+                "  2. https://huggingface.co/pyannote/segmentation-3.0\n"
+                "  3. https://huggingface.co/pyannote/speaker-diarization-community-1\n"
+                "Skipping diarization. All speech will be attributed to Speaker 1.\n",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Warning: Failed to load diarization model: {e}\n"
+                "Skipping diarization. All speech will be attributed to Speaker 1.\n",
+                file=sys.stderr,
+            )
+        return None
+
+
+def _diarize_local(audio_path: str, words: list[dict], pipeline) -> list[dict]:
+    """
+    Run speaker diarization with a pre-loaded pipeline and assign speaker labels to words.
+
+    Args:
+        audio_path: Path to the audio file.
+        words: List of word dicts with text/start/end/speaker_id keys.
+        pipeline: Pre-loaded pyannote diarization pipeline.
+
+    Returns:
+        Updated word list with speaker_id set from diarization.
+    """
+    print("Running speaker diarization...")
+    try:
         diarization = pipeline(audio_path)
     except Exception as e:
         print(
