@@ -335,10 +335,36 @@ def parse_feed(feed_url: str) -> tuple[str, list[Episode]]:
     return podcast_name, episodes
 
 
-# ── ElevenLabs transcription ────────────────────────────────────────────────
+# ── Transcription ──────────────────────────────────────────────────────────
 
 
-def transcribe(source: str, *, is_file: bool = False) -> tuple[list[TranscriptSegment], float]:
+def transcribe(
+    source: str,
+    *,
+    is_file: bool = False,
+    provider: str = "elevenlabs",
+    whisper_model: str = "base",
+    hf_token: str | None = None,
+) -> tuple[list[TranscriptSegment], float]:
+    """
+    Transcribe audio, routing to the appropriate backend.
+
+    Args:
+        source: Either a cloud URL or a local file path.
+        is_file: True if source is a local file path.
+        provider: "elevenlabs" or "local".
+        whisper_model: Whisper model size (only used when provider="local").
+        hf_token: HuggingFace token for pyannote diarization (only used when provider="local").
+
+    Returns:
+        (segments, duration_seconds)
+    """
+    if provider == "local":
+        return transcribe_local(source, is_file=is_file, model_size=whisper_model, hf_token=hf_token)
+    return transcribe_elevenlabs(source, is_file=is_file)
+
+
+def transcribe_elevenlabs(source: str, *, is_file: bool = False) -> tuple[list[TranscriptSegment], float]:
     """
     Transcribe audio via ElevenLabs Scribe API.
 
@@ -424,6 +450,170 @@ def group_into_segments(words: list[dict]) -> list[TranscriptSegment]:
     return segments
 
 
+# ── Local (Whisper) transcription ──────────────────────────────────────────
+
+
+def transcribe_local(
+    source: str,
+    *,
+    is_file: bool = False,
+    model_size: str = "base",
+    hf_token: str | None = None,
+) -> tuple[list[TranscriptSegment], float]:
+    """
+    Transcribe audio locally using faster-whisper, with optional pyannote diarization.
+
+    Args:
+        source: Audio file path or URL.
+        is_file: True if source is a local file path.
+        model_size: Whisper model size (tiny/base/small/medium/large-v2/large-v3).
+        hf_token: HuggingFace token for pyannote speaker diarization.
+
+    Returns:
+        (segments, duration_seconds)
+    """
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        print(
+            "Error: faster-whisper is not installed.\n"
+            "Install local transcription dependencies with:\n"
+            "  pip install podscript[local]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # If source is a URL, download to a temp file
+    temp_path = None
+    audio_path = source
+    if not is_file:
+        print("Downloading audio for local transcription...")
+        temp_path = os.path.join(tempfile.gettempdir(), f"podscript-local-{os.getpid()}.mp3")
+        resp = requests.get(source, timeout=600, stream=True)
+        resp.raise_for_status()
+        with open(temp_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+        size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+        print(f"Downloaded: {size_mb:.1f} MB\n")
+        audio_path = temp_path
+
+    try:
+        # Auto-detect device and compute type
+        import torch
+
+        if torch.cuda.is_available():
+            device, compute_type = "cuda", "float16"
+            print(f"Using GPU (CUDA) with {model_size} model")
+        else:
+            device, compute_type = "cpu", "int8"
+            print(f"Using CPU with {model_size} model (this may be slow for large files)")
+
+        print("Loading Whisper model...")
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+
+        print("Transcribing...")
+        segments_iter, info = model.transcribe(audio_path, word_timestamps=True)
+
+        # Collect all words from all segments
+        words: list[dict] = []
+        for segment in segments_iter:
+            if segment.words:
+                for w in segment.words:
+                    words.append({
+                        "text": w.word.strip(),
+                        "start": w.start,
+                        "end": w.end,
+                        "speaker_id": "speaker_0",
+                    })
+
+        duration = info.duration
+
+        # Run diarization if HF token is provided
+        if hf_token and words:
+            words = _diarize_local(audio_path, words, hf_token)
+
+        segments = group_into_segments(words)
+        return segments, duration
+
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+def _diarize_local(audio_path: str, words: list[dict], hf_token: str) -> list[dict]:
+    """
+    Run pyannote speaker diarization and assign speaker labels to words.
+
+    Args:
+        audio_path: Path to the audio file.
+        words: List of word dicts with text/start/end/speaker_id keys.
+        hf_token: HuggingFace token for pyannote models.
+
+    Returns:
+        Updated word list with speaker_id set from diarization.
+    """
+    try:
+        from pyannote.audio import Pipeline
+    except (ImportError, Exception) as e:
+        if isinstance(e, ImportError):
+            print(
+                "Warning: pyannote.audio is not installed. Skipping speaker diarization.\n"
+                "All speech will be attributed to Speaker 1.\n"
+                "Install with: pip install podscript[local]",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Warning: Failed to load pyannote.audio: {e}\n"
+                "Skipping speaker diarization. All speech will be attributed to Speaker 1.",
+                file=sys.stderr,
+            )
+        return words
+
+    print("Running speaker diarization...")
+    try:
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=hf_token,
+        )
+
+        import torch
+
+        if torch.cuda.is_available():
+            pipeline.to(torch.device("cuda"))
+
+        diarization = pipeline(audio_path)
+    except Exception as e:
+        print(
+            f"Warning: Speaker diarization failed: {e}\n"
+            "All speech will be attributed to Speaker 1.",
+            file=sys.stderr,
+        )
+        return words
+
+    # Build list of (start, end, speaker) turns
+    turns = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        turns.append((turn.start, turn.end, speaker))
+
+    # Map each word to a speaker by matching word midpoint to speaker turns
+    for w in words:
+        midpoint = (w["start"] + w["end"]) / 2
+        for turn_start, turn_end, speaker in turns:
+            if turn_start <= midpoint <= turn_end:
+                # Normalize pyannote labels (SPEAKER_00 → speaker_0)
+                num = re.search(r"(\d+)", speaker)
+                w["speaker_id"] = f"speaker_{int(num.group(1))}" if num else "speaker_0"
+                break
+
+    print("Diarization complete.\n")
+    return words
+
+
 # ── Markdown generation ─────────────────────────────────────────────────────
 
 
@@ -483,6 +673,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--latest", action="store_true", help="Transcribe the most recent episode (default)")
     parser.add_argument("--list", action="store_true", dest="list_episodes", help="List episodes without transcribing")
     parser.add_argument("--output", metavar="FILE", help="Output filename (default: auto-generated)")
+    parser.add_argument("--local", action="store_true", help="Use local Whisper model instead of ElevenLabs")
+    parser.add_argument(
+        "--model",
+        choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+        default="base",
+        help="Whisper model size (default: base). Only used with --local",
+    )
+    parser.add_argument("--hf-token", metavar="TOKEN", help="HuggingFace token for pyannote speaker diarization")
     return parser
 
 
@@ -528,10 +726,14 @@ def main():
         sys.exit(1)
 
     url: str = args.url
+    provider = "local" if args.local else "elevenlabs"
+    hf_token = getattr(args, "hf_token", None) or os.environ.get("HF_TOKEN")
+    whisper_model = args.model
 
     # ── YouTube path ─────────────────────────────────────────────────────
     if is_youtube_url(url):
-        require_api_key()
+        if provider != "local":
+            require_api_key()
         print("\nDetected YouTube URL\n")
         yt = download_youtube_audio(url)
 
@@ -540,7 +742,10 @@ def main():
 
         try:
             t0 = time.time()
-            segments, duration = transcribe(yt["audio_path"], is_file=True)
+            segments, duration = transcribe(
+                yt["audio_path"], is_file=True,
+                provider=provider, whisper_model=whisper_model, hf_token=hf_token,
+            )
             elapsed = int(time.time() - t0)
         finally:
             # Clean up temp file
@@ -663,7 +868,8 @@ def main():
     if args.list_episodes or (args.search and args.episode is None and not apple_episode_id):
         return
 
-    require_api_key()
+    if provider != "local":
+        require_api_key()
 
     # Select episode
     if apple_selected is not None:
@@ -701,7 +907,10 @@ def main():
             sys.exit(1)
         try:
             t0 = time.time()
-            segments, duration = transcribe(temp_audio, is_file=True)
+            segments, duration = transcribe(
+                temp_audio, is_file=True,
+                provider=provider, whisper_model=whisper_model, hf_token=hf_token,
+            )
             elapsed = int(time.time() - t0)
         finally:
             try:
@@ -710,7 +919,10 @@ def main():
                 pass
     else:
         t0 = time.time()
-        segments, duration = transcribe(selected.audio_url)
+        segments, duration = transcribe(
+            selected.audio_url,
+            provider=provider, whisper_model=whisper_model, hf_token=hf_token,
+        )
         elapsed = int(time.time() - t0)
 
     print(f"\nTranscription complete in {elapsed} seconds.")
